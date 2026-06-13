@@ -20,7 +20,7 @@ const TAVILY_URL = 'https://api.tavily.com/search';
  * Run a single search, restricted to allowedDomains when provided.
  * Returns a normalized array of { title, url, content }.
  */
-async function searchOnce(query, allowedDomains, tavilyKey, maxResults = 5) {
+export async function searchOnce(query, allowedDomains, tavilyKey, maxResults = 5) {
   const body = {
     api_key: tavilyKey,
     query,

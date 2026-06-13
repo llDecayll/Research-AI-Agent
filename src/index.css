@@ -418,6 +418,51 @@ p, li, label, span {
   text-overflow: ellipsis;
 }
 
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.data-table th {
+  text-align: left;
+  padding: 10px 16px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: hsl(var(--text-muted));
+  border-bottom: 1px solid var(--border-glow);
+  position: sticky;
+  top: 0;
+  background: hsl(var(--card, 222 47% 11%));
+}
+
+.data-table td {
+  padding: 9px 16px;
+  border-bottom: 1px solid var(--border-glow);
+  color: hsl(var(--text-secondary));
+  vertical-align: top;
+}
+
+.data-table tr:hover td {
+  background: rgba(139, 92, 246, 0.04);
+}
+
+.node-source-tag {
+  font-size: 9.5px;
+  font-weight: 600;
+  margin-top: 4px;
+  color: #8b5cf6;
+  background: rgba(139, 92, 246, 0.1);
+  border-radius: 4px;
+  padding: 1px 6px;
+  display: inline-block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
 .node-badge {
   font-size: 9px;
   padding: 1px 4px;

@@ -5,6 +5,7 @@
  */
 
 import { gatherEvidence, formatEvidenceForPrompt } from './research.js';
+import { gatherEvidenceForSource, getSourceProfile } from './sources.js';
 
 // Presets data structured as trees
 export const PRESETS = {
@@ -308,17 +309,21 @@ function normalizeTree(rawChildren, level = 1, counter = { n: 0 }) {
  * what each should investigate, and which domains each is allowed to search.
  * Returns the full runtime tree, ready to run or to hand back to the UI for approval.
  */
-export async function planAgentTree(industry, context, apiKey, provider) {
+export async function planAgentTree(industry, context, apiKey, provider, goal = null) {
   if (!apiKey) {
     // No LLM key -> caller falls back to preset/fallback tree.
     return null;
   }
 
+  const goalLine = goal
+    ? `STRUCTURED GOAL — Industry: "${goal.industry || industry}"${goal.field ? `, Field/Specialty: "${goal.field}"` : ''}${goal.location ? `, Location: "${goal.location}"` : ''}`
+    : `INDUSTRY / FIELD / LOCATION: "${industry}"`;
+
   const planPrompt = `
 You are the MASTER ORCHESTRATOR of a market-research agent network.
 Design a team of specialist sub-agents to research this brief.
 
-INDUSTRY / FIELD / LOCATION: "${industry}"
+${goalLine}
 RESEARCH CONTEXT: "${context}"
 
 Rules:
@@ -364,11 +369,17 @@ Respond with ONLY valid JSON, no markdown, in this exact schema:
  * Ask the agent to turn its mandate into concrete search queries.
  */
 async function generateQueries(node, industry, context, apiKey, provider) {
+  const profile = getSourceProfile(node.source);
+  const sourceHint = node.source && node.source !== 'web'
+    ? `Your data SOURCE is ${profile.label}. Phrase queries to surface results that exist on that source (do not add the site: operator yourself — the system scopes the search).`
+    : 'Use precise open-web queries.';
+
   const prompt = `
 You are research agent "${node.name}" (${node.role}).
 Mandate: "${node.instructions}".
 Brief: "${industry}" - "${context}".
-Produce 2-3 precise web-search queries that will surface real data for your mandate.
+${sourceHint}
+Produce 2-3 precise search queries that will surface real data for your mandate.
 Respond with ONLY JSON: { "queries": ["...", "..."] }
 `;
   try {
@@ -580,6 +591,174 @@ const MOCK_REPORTS = {
 };
 
 /**
+ * PHASE 3 — AGGREGATOR + ANALYSIS ENGINE.
+ *
+ * Takes every sub-agent's grounded report and distills it into ONE structured
+ * analysis object: a deduplicated contact/entity directory, market sizing,
+ * sentiment, an ideal-vs-actual gap with error margins, and chart-ready
+ * statistics (source distribution for the Sankey, success/growth rates).
+ *
+ * This is the layer that turns scattered agent findings into the decision-grade
+ * data the report and exports (Phase 4) are built from.
+ */
+const ANALYSIS_SCHEMA_HINT = `{
+  "marketSize": {
+    "headline": "one-line market-size statement",
+    "totalEstimate": "e.g. ~3,000 cardiologists in Bangalore",
+    "breakdown": [{ "segment": "Manipal Hospitals", "count": "120", "note": "string" }]
+  },
+  "contacts": [
+    { "name": "string", "organization": "string", "role": "string",
+      "phone": "string or empty", "location": "string", "rating": "string or empty",
+      "source": "which source agent surfaced this", "url": "source url or empty" }
+  ],
+  "sentiment": {
+    "overall": "Positive | Mixed | Negative",
+    "positives": ["recurring praise themes"],
+    "negatives": ["recurring complaint themes"],
+    "byEntity": [{ "name": "string", "score": "0-100", "summary": "one line" }]
+  },
+  "idealVsActual": {
+    "dimensions": [
+      { "dimension": "string", "ideal": "benchmark/best-in-class value",
+        "actual": "observed value", "errorMargin": "gap as % or qualitative",
+        "improvement": "concrete action to close the gap" }
+    ]
+  },
+  "statistics": {
+    "successRate": "0-100 or qualitative",
+    "growthRate": "e.g. +12% YoY",
+    "confidence": "0-100",
+    "sourceDistribution": [{ "source": "Instagram", "count": 4 }]
+  }
+}`;
+
+export async function analyzeResults(industry, context, goal, flatReports, apiKey, provider) {
+  if (!apiKey || flatReports.length === 0) {
+    return getMockAnalysis(industry, goal, flatReports);
+  }
+
+  const goalLine = goal
+    ? `Industry: ${goal.industry || industry}${goal.field ? `, Field: ${goal.field}` : ''}${goal.location ? `, Location: ${goal.location}` : ''}`
+    : industry;
+
+  const prompt = `
+You are the AGGREGATOR & ANALYSIS engine of a research network.
+Goal: ${goalLine}
+Context: "${context}"
+
+Below are the structured reports from every source agent. AGGREGATE them: deduplicate
+entities/contacts that appear across sources, normalize fields, and derive the analysis.
+Only use information actually present in the agent reports — do NOT invent contacts,
+phone numbers, or statistics. Leave a field empty if the data was not found.
+
+AGENT REPORTS:
+${JSON.stringify(flatReports, null, 2)}
+
+Respond with ONLY valid JSON in EXACTLY this schema (no markdown):
+${ANALYSIS_SCHEMA_HINT}
+`;
+
+  try {
+    const analysis = await callAIProvider(prompt, apiKey, provider, true);
+    return normalizeAnalysis(analysis, industry, goal, flatReports);
+  } catch (err) {
+    console.warn('Analysis step failed, using mock analysis:', err.message);
+    return getMockAnalysis(industry, goal, flatReports);
+  }
+}
+
+/**
+ * Guarantee the analysis object always has the shape the UI/exports expect,
+ * and backfill the source distribution from the actual agent reports.
+ */
+function normalizeAnalysis(a, industry, goal, flatReports) {
+  const safe = a && typeof a === 'object' ? a : {};
+  const sourceDist = buildSourceDistribution(flatReports);
+
+  return {
+    marketSize: {
+      headline: safe.marketSize?.headline || `Market overview for ${goal?.field || industry}.`,
+      totalEstimate: safe.marketSize?.totalEstimate || 'Not quantified from available sources.',
+      breakdown: Array.isArray(safe.marketSize?.breakdown) ? safe.marketSize.breakdown : []
+    },
+    contacts: Array.isArray(safe.contacts) ? safe.contacts : [],
+    sentiment: {
+      overall: safe.sentiment?.overall || 'Mixed',
+      positives: Array.isArray(safe.sentiment?.positives) ? safe.sentiment.positives : [],
+      negatives: Array.isArray(safe.sentiment?.negatives) ? safe.sentiment.negatives : [],
+      byEntity: Array.isArray(safe.sentiment?.byEntity) ? safe.sentiment.byEntity : []
+    },
+    idealVsActual: {
+      dimensions: Array.isArray(safe.idealVsActual?.dimensions) ? safe.idealVsActual.dimensions : []
+    },
+    statistics: {
+      successRate: safe.statistics?.successRate ?? 'N/A',
+      growthRate: safe.statistics?.growthRate ?? 'N/A',
+      confidence: safe.statistics?.confidence ?? 'N/A',
+      sourceDistribution: (Array.isArray(safe.statistics?.sourceDistribution) && safe.statistics.sourceDistribution.length)
+        ? safe.statistics.sourceDistribution
+        : sourceDist
+    }
+  };
+}
+
+/** Count how many sources each agent's source contributed (for the Sankey). */
+function buildSourceDistribution(flatReports) {
+  const counts = {};
+  flatReports.forEach((r) => {
+    const src = r.report?.source || 'Open Web';
+    const n = r.report?.sourceList?.length || r.report?.sourcesRetrieved || 1;
+    counts[src] = (counts[src] || 0) + n;
+  });
+  return Object.entries(counts).map(([source, count]) => ({ source, count }));
+}
+
+/** Deterministic mock analysis so the feature works fully without any keys. */
+function getMockAnalysis(industry, goal, flatReports) {
+  const field = goal?.field || 'specialists';
+  const location = goal?.location || 'the target region';
+
+  return {
+    marketSize: {
+      headline: `Estimated demand for ${field} in ${location} is moderate-to-strong with fragmented supply.`,
+      totalEstimate: `~3,000 ${field} in ${location} (illustrative mock figure)`,
+      breakdown: [
+        { segment: 'Large hospital chains (e.g. Manipal, Narayana)', count: '~640', note: 'Concentrated, high-throughput' },
+        { segment: 'Independent clinics', count: '~1,500', note: 'Highly fragmented' },
+        { segment: 'Multi-specialty hospitals', count: '~860', note: 'Mid-tier capacity' }
+      ]
+    },
+    contacts: [
+      { name: 'Dr. A. Sample', organization: 'Manipal Hospitals', role: field, phone: '+91-80-XXXXXXX', location, rating: '4.6/5', source: 'Specific Websites', url: 'https://www.practo.com/' },
+      { name: 'Dr. B. Example', organization: 'Independent Clinic', role: field, phone: '', location, rating: '4.2/5', source: 'Google Advanced Search', url: 'https://www.google.com/' }
+    ],
+    sentiment: {
+      overall: 'Mixed',
+      positives: ['Praised for clinical expertise', 'Short diagnosis turnaround at large chains'],
+      negatives: ['Long appointment wait times', 'Billing transparency complaints'],
+      byEntity: [
+        { name: 'Manipal Hospitals', score: '78', summary: 'Strong outcomes, criticized for wait times.' },
+        { name: 'Independent clinics', score: '64', summary: 'Personal care praised, inconsistent availability.' }
+      ]
+    },
+    idealVsActual: {
+      dimensions: [
+        { dimension: 'Online discoverability', ideal: '90% with rich profiles', actual: '~55%', errorMargin: '35%', improvement: 'Standardize listings on Practo/JustDial with reviews.' },
+        { dimension: 'Avg. appointment wait', ideal: '< 2 days', actual: '~5 days', errorMargin: '+150%', improvement: 'Add online scheduling and triage.' },
+        { dimension: 'Review volume', ideal: '> 100/provider', actual: '~30/provider', errorMargin: '70%', improvement: 'Post-visit review solicitation flow.' }
+      ]
+    },
+    statistics: {
+      successRate: '72',
+      growthRate: '+11% YoY',
+      confidence: '64',
+      sourceDistribution: buildSourceDistribution(flatReports)
+    }
+  };
+}
+
+/**
  * Flattens all agent reports recursively from the tree to prepare synthesis
  */
 export function flattenTreeReports(node) {
@@ -695,13 +874,22 @@ ${flattenedReports.map(a => `  - **${a.name}**: ${a.report.gaps}`).join("\n")}
  * Dynamic Mock Report generator for custom nodes
  */
 function getDynamicNodeMockReport(node, industry, context) {
+  const profile = getSourceProfile(node.source);
+  const sampleUrl = {
+    instagram: 'https://www.instagram.com/explore/',
+    reddit: 'https://www.reddit.com/search/',
+    facebook: 'https://www.facebook.com/search/',
+    youtube: 'https://www.youtube.com/results'
+  }[node.source] || 'https://www.statista.com/';
+
   return {
     agentName: node.name,
     researchQuestion: node.instructions,
+    source: profile.label,
     keyFindings: [
-      `Detailed findings indicate solid potential for ${industry} in relation to node mandate: ${node.role}.`,
-      `Initial assessments reveal standard operational margins of 35% - 48% with moderate local overhead.`,
-      "Competitor benchmarking indicates several active pilots but no dominant player is established."
+      `[${profile.label}] Detailed findings indicate solid potential for ${industry} in relation to node mandate: ${node.role}.`,
+      `Initial ${profile.label} assessments reveal standard operational margins of 35% - 48% with moderate local overhead.`,
+      `${profile.label} benchmarking indicates several active pilots but no dominant player is established.`
     ],
     dataPoints: [
       "Operational index: 7.2/10",
@@ -709,7 +897,7 @@ function getDynamicNodeMockReport(node, industry, context) {
       "Customer interest rating: 82%"
     ],
     sourceList: [
-      "https://www.statista.com/",
+      sampleUrl,
       `https://www.google.com/search?q=${encodeURIComponent(node.name)}`
     ],
     confidenceLevel: "Medium",
@@ -751,12 +939,15 @@ async function executeTreeAPI(tree, industry, context, apiKey, provider, onProgr
     log(`Planning search queries for Level ${node.level} mandate...`);
     const queries = await generateQueries(node, industry, context, apiKey, provider);
 
-    // 2. Retrieve REAL evidence, restricted to this agent's allowed domains.
+    // 2. Retrieve REAL evidence via this agent's SOURCE adapter (web, google,
+    //    instagram, reddit, youtube, facebook, website). The adapter decides
+    //    domain scoping and query rewriting for that source.
+    const sourceProfile = getSourceProfile(node.source);
     let evidence = [];
     if (tavilyKey) {
-      evidence = await gatherEvidence(queries, node.allowedDomains, tavilyKey, log);
+      evidence = await gatherEvidenceForSource(node.source, queries, node.allowedDomains, tavilyKey, log);
     } else {
-      log('No search key configured — running UNGROUNDED (findings will not be web-verified).');
+      log(`No search key configured — ${sourceProfile.label} agent running UNGROUNDED (findings will not be web-verified).`);
     }
     const evidenceBlock = formatEvidenceForPrompt(evidence);
 
@@ -764,10 +955,11 @@ async function executeTreeAPI(tree, industry, context, apiKey, provider, onProgr
     const nodePrompt = `
 You are research agent "${node.name}" (Level ${node.level}), role: "${node.role}".
 Mandate: "${node.instructions}".
+Data source: ${sourceProfile.label}.
 Brief: "${industry}" - "${context}".
 Parent agent context: "${parentContext}".
 
-You are given numbered SOURCES retrieved from the web. Base every finding and data
+You are given numbered SOURCES retrieved from ${sourceProfile.label}. Base every finding and data
 point ONLY on these sources. Do NOT invent statistics. Every item in "sourceList"
 MUST be a URL that appears in the SOURCES below — never fabricate a URL. If the
 sources do not support a claim, omit it and record the missing information under "gaps".
@@ -797,6 +989,7 @@ Respond with ONLY JSON:
     node.report = {
       agentName: node.name,
       researchQuestion: node.instructions,
+      source: sourceProfile.label,
       keyFindings: responseJson.keyFindings || [],
       dataPoints: responseJson.dataPoints || [],
       sourceList: verifiedSources,
@@ -992,7 +1185,7 @@ async function executeTreeMock(tree, industry, context, onProgress) {
  * Main Run Orchestrator entry point (tree-compatible)
  */
 export async function runOrchestratorDetailed(industry, context, customAgents = [], options = {}) {
-  const { apiKey = null, provider = 'gemini', onProgress = () => {}, activeTree = null, tavilyApiKey = null } = options;
+  const { apiKey = null, provider = 'gemini', onProgress = () => {}, activeTree = null, tavilyApiKey = null, goal = null } = options;
 
   // Build a tree from inputs. Priority: explicit activeTree (approved in UI) >
   // LLM-designed tree (planner) > preset > hardcoded fallback.
@@ -1005,7 +1198,7 @@ export async function runOrchestratorDetailed(industry, context, customAgents = 
     if (apiKey) {
       try {
         onProgress({ status: 'analyzing', message: 'Master Orchestrator designing the sub-agent network from your brief...' });
-        planned = await planAgentTree(industry, context, apiKey, provider);
+        planned = await planAgentTree(industry, context, apiKey, provider, goal);
       } catch (err) {
         console.warn('Planner failed, falling back to preset/fallback tree:', err.message);
       }
@@ -1077,16 +1270,27 @@ export async function runOrchestratorDetailed(industry, context, customAgents = 
   }
 
   // Run Tree API or Mock
+  let execResult = null;
   if (apiKey) {
     try {
-      return await executeTreeAPI(treeToRun, industry, context, apiKey, provider, onProgress, tavilyApiKey);
+      execResult = await executeTreeAPI(treeToRun, industry, context, apiKey, provider, onProgress, tavilyApiKey);
     } catch (err) {
       console.warn("Failed API run, falling back to mock:", err.message);
       // fallback
     }
   }
 
-  return await executeTreeMock(treeToRun, industry, context, onProgress);
+  if (!execResult) {
+    execResult = await executeTreeMock(treeToRun, industry, context, onProgress);
+  }
+
+  // PHASE 3 — aggregate every agent's report into a structured analysis.
+  onProgress({ status: 'aggregating', message: 'Aggregator consolidating, deduplicating, and analyzing cross-source findings...' });
+  const flatReports = flattenTreeReports(execResult.tree);
+  const analysis = await analyzeResults(industry, context, goal, flatReports, apiKey, provider);
+  onProgress({ status: 'analysis_complete', analysis });
+
+  return { ...execResult, analysis };
 }
 
 export async function runOrchestrator(industry, context, customAgents = [], options = {}) {
