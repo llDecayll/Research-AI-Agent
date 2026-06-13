@@ -91,6 +91,7 @@ export default function App() {
   const [apiProvider, setApiProvider] = useState('gemini');
   const [apiKeys, setApiKeys] = useState({ gemini: '', openai: '', anthropic: '', openrouter: '' });
   const [currentKeyInput, setCurrentKeyInput] = useState('');
+  const [tavilyKey, setTavilyKey] = useState('');
   const [showSettingsModal, setShowSettingsModal] = useState(false);
 
   // Orchestrator Execution State
@@ -135,6 +136,7 @@ export default function App() {
           openrouter: '',
           ...(settings.apiKeys || {})
         });
+        setTavilyKey(settings.tavilyApiKey || '');
         setHistory(historyItems);
       } catch (error) {
         console.error('Failed to load backend state:', error);
@@ -267,16 +269,42 @@ export default function App() {
         method: 'PUT',
         body: JSON.stringify({
           provider: apiProvider,
-          apiKeys: updatedKeys
+          apiKeys: updatedKeys,
+          tavilyApiKey: tavilyKey
         })
       });
 
       setApiProvider(saved.provider);
       setApiKeys(saved.apiKeys);
+      setTavilyKey(saved.tavilyApiKey || '');
       alert(`${apiProvider.toUpperCase()} API key saved to the backend database.`);
     } catch (error) {
       console.error(error);
       alert(`Unable to save key: ${error.message}`);
+    }
+  };
+
+  // Save Tavily web-search key (enables grounded research)
+  const saveTavilyKey = async () => {
+    try {
+      const saved = await apiRequest('/settings', {
+        method: 'PUT',
+        body: JSON.stringify({
+          provider: apiProvider,
+          apiKeys,
+          tavilyApiKey: tavilyKey
+        })
+      });
+
+      setApiProvider(saved.provider);
+      setApiKeys(saved.apiKeys);
+      setTavilyKey(saved.tavilyApiKey || '');
+      alert(tavilyKey
+        ? 'Tavily search key saved. Agents will now ground findings in real web sources.'
+        : 'Tavily search key cleared. Agents will run ungrounded.');
+    } catch (error) {
+      console.error(error);
+      alert(`Unable to save Tavily key: ${error.message}`);
     }
   };
 
@@ -1203,6 +1231,29 @@ export default function App() {
               </p>
             </div>
 
+            {/* Tavily web-search key (grounded research) */}
+            <div className="form-group">
+              <label className="form-label">
+                Tavily Search API Key
+              </label>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <input
+                  type="password"
+                  className="form-input"
+                  placeholder="Paste your Tavily key to enable grounded research..."
+                  value={tavilyKey}
+                  onChange={(e) => setTavilyKey(e.target.value)}
+                  style={{ flex: 1 }}
+                />
+                <button className="btn btn-primary" onClick={saveTavilyKey}>
+                  Save
+                </button>
+              </div>
+              <p style={{ fontSize: '11px', color: 'hsl(var(--text-muted))', marginTop: '4px' }}>
+                Optional. When set, sub-agents perform real web search (restricted to their allowed domains) and must ground every finding in retrieved sources. Leave empty to run ungrounded.
+              </p>
+            </div>
+
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
               <button 
                 className="btn btn-secondary" 
@@ -1214,13 +1265,15 @@ export default function App() {
                       method: 'PUT',
                       body: JSON.stringify({
                         provider: apiProvider,
-                        apiKeys: updatedKeys
+                        apiKeys: updatedKeys,
+                        tavilyApiKey: tavilyKey
                       })
                     });
 
                     setCurrentKeyInput('');
                     setApiProvider(saved.provider);
                     setApiKeys(saved.apiKeys);
+                    setTavilyKey(saved.tavilyApiKey || '');
                   } catch (error) {
                     console.error(error);
                     alert(`Unable to clear key: ${error.message}`);
