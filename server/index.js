@@ -72,6 +72,7 @@ app.post('/api/orchestrations', (req, res) => {
   const settings = getSettings();
   const selectedProvider = provider || settings.provider || 'gemini';
   const apiKey = settings.apiKeys?.[selectedProvider] || null;
+  const tavilyApiKey = settings.tavilyApiKey || null;
   const job = createJob();
 
   const pushEvent = (event) => {
@@ -87,7 +88,8 @@ app.post('/api/orchestrations', (req, res) => {
         apiKey,
         provider: selectedProvider,
         activeTree,
-        onProgress: pushEvent
+        onProgress: pushEvent,
+        tavilyApiKey
       });
 
       const historyItem = insertHistoryRun({

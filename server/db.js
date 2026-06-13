@@ -36,7 +36,8 @@ const defaultSettings = {
     openai: '',
     anthropic: '',
     openrouter: ''
-  }
+  },
+  tavilyApiKey: ''
 };
 
 function readSetting(key) {
@@ -55,7 +56,8 @@ function writeSetting(key, value) {
 export function getSettings() {
   return {
     provider: readSetting('provider') ?? defaultSettings.provider,
-    apiKeys: readSetting('apiKeys') ?? defaultSettings.apiKeys
+    apiKeys: readSetting('apiKeys') ?? defaultSettings.apiKeys,
+    tavilyApiKey: readSetting('tavilyApiKey') ?? defaultSettings.tavilyApiKey
   };
 }
 
@@ -65,11 +67,13 @@ export function saveSettings(settings) {
     apiKeys: {
       ...defaultSettings.apiKeys,
       ...(settings.apiKeys ?? {})
-    }
+    },
+    tavilyApiKey: settings.tavilyApiKey ?? defaultSettings.tavilyApiKey
   };
 
   writeSetting('provider', merged.provider);
   writeSetting('apiKeys', merged.apiKeys);
+  writeSetting('tavilyApiKey', merged.tavilyApiKey);
   return merged;
 }
 
