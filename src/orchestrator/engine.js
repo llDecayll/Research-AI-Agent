@@ -4,6 +4,8 @@
  * and API integrations for Gemini, ChatGPT (OpenAI), Claude (Anthropic), and OpenRouter.
  */
 
+import { gatherEvidence, formatEvidenceForPrompt } from './research.js';
+
 // Presets data structured as trees
 export const PRESETS = {
   solar: {
@@ -208,7 +210,7 @@ export async function callAIProvider(prompt, apiKey, provider, expectJson = true
       contents: [{ parts: [{ text: prompt }] }],
       generationConfig: expectJson ? { responseMimeType: "application/json" } : {}
     };
-  } 
+  }
   else if (cleanProvider === 'openai' || cleanProvider === 'chatgpt') {
     url = "https://api.openai.com/v1/chat/completions";
     headers["Authorization"] = `Bearer ${apiKey}`;
@@ -217,20 +219,17 @@ export async function callAIProvider(prompt, apiKey, provider, expectJson = true
       messages: [{ role: "user", content: prompt }],
       response_format: expectJson ? { type: "json_object" } : undefined
     };
-  } 
+  }
   else if (cleanProvider === 'anthropic' || cleanProvider === 'claude') {
-    // Note: Anthropic often blocks direct browser calls due to CORS, but works in CLI.
-    // If running in browser, it might require a CORS proxy or fail.
     url = "https://api.anthropic.com/v1/messages";
     headers["x-api-key"] = apiKey;
     headers["anthropic-version"] = "2023-06-01";
-    headers["dangerouslyAllowBrowser"] = "true"; // For test/dev apps
     body = {
-      model: "claude-3-5-sonnet-20241022",
+      model: "claude-sonnet-4-6",
       max_tokens: 4000,
       messages: [{ role: "user", content: prompt }]
     };
-  } 
+  }
   else if (cleanProvider === 'openrouter') {
     url = "https://openrouter.ai/api/v1/chat/completions";
     headers["Authorization"] = `Bearer ${apiKey}`;
@@ -239,7 +238,7 @@ export async function callAIProvider(prompt, apiKey, provider, expectJson = true
       messages: [{ role: "user", content: prompt }],
       response_format: expectJson ? { type: "json_object" } : undefined
     };
-  } 
+  }
   else {
     throw new Error(`Unsupported API provider: ${provider}`);
   }
@@ -278,6 +277,145 @@ export async function callAIProvider(prompt, apiKey, provider, expectJson = true
   }
 
   return textResult;
+}
+
+/**
+ * Assigns ids, levels, status, and default fields to an LLM-generated tree.
+ * The planner returns only { name, role, instructions, allowedDomains, children },
+ * so we normalize it into the runtime node shape the rest of the engine uses.
+ */
+function normalizeTree(rawChildren, level = 1, counter = { n: 0 }) {
+  return (rawChildren || []).map((node) => {
+    counter.n += 1;
+    return {
+      id: `agent-${counter.n}`,
+      name: (node.name || `AGENT_${counter.n}`).toUpperCase().replace(/\s+/g, '_'),
+      role: node.role || 'Research Specialist',
+      instructions: node.instructions || '',
+      allowedDomains: Array.isArray(node.allowedDomains) ? node.allowedDomains : [],
+      level,
+      status: 'idle',
+      logs: [],
+      children: normalizeTree(node.children, level + 1, counter)
+    };
+  });
+}
+
+/**
+ * THE ORCHESTRATOR'S ACTUAL JOB.
+ * In the original code this step was a fake 1.2s delay. Here the master agent
+ * reads the brief and DESIGNS the sub-agent network: which specialists to spawn,
+ * what each should investigate, and which domains each is allowed to search.
+ * Returns the full runtime tree, ready to run or to hand back to the UI for approval.
+ */
+export async function planAgentTree(industry, context, apiKey, provider) {
+  if (!apiKey) {
+    // No LLM key -> caller falls back to preset/fallback tree.
+    return null;
+  }
+
+  const planPrompt = `
+You are the MASTER ORCHESTRATOR of a market-research agent network.
+Design a team of specialist sub-agents to research this brief.
+
+INDUSTRY / FIELD / LOCATION: "${industry}"
+RESEARCH CONTEXT: "${context}"
+
+Rules:
+- Create 2 to 4 top-level (Level 1) agents covering distinct angles (e.g. unit economics,
+  demand & market size, competition, regulation/risk). Avoid overlap.
+- Give a Level 1 agent its own children (Level 2) ONLY when a sub-question is deep enough
+  to deserve a dedicated specialist. Max depth = 2 levels. Do not over-nest.
+- For each agent, propose 1 to 4 "allowedDomains": authoritative, real source domains
+  relevant to THAT agent's mandate and the brief's location (government bodies, regulators,
+  industry associations, reputable data sources). Use bare domains, e.g. "who.int", "nic.in".
+  Leave the array empty only if the agent genuinely needs open-web search.
+
+Respond with ONLY valid JSON, no markdown, in this exact schema:
+{
+  "children": [
+    {
+      "name": "CODE_NAME",
+      "role": "Short specialist role",
+      "instructions": "Specific research questions this agent must answer.",
+      "allowedDomains": ["example.gov", "example.org"],
+      "children": []
+    }
+  ]
+}
+`;
+
+  const planned = await callAIProvider(planPrompt, apiKey, provider, true);
+  const children = normalizeTree(planned.children, 1, { n: 0 });
+
+  return {
+    id: 'agent-master',
+    name: 'MASTER_ORCHESTRATOR',
+    role: 'Master Orchestrator',
+    instructions: 'Designs the agent network, coordinates research, and synthesizes the final report.',
+    level: 0,
+    status: 'idle',
+    logs: [],
+    children
+  };
+}
+
+/**
+ * Ask the agent to turn its mandate into concrete search queries.
+ */
+async function generateQueries(node, industry, context, apiKey, provider) {
+  const prompt = `
+You are research agent "${node.name}" (${node.role}).
+Mandate: "${node.instructions}".
+Brief: "${industry}" - "${context}".
+Produce 2-3 precise web-search queries that will surface real data for your mandate.
+Respond with ONLY JSON: { "queries": ["...", "..."] }
+`;
+  try {
+    const out = await callAIProvider(prompt, apiKey, provider, true);
+    if (Array.isArray(out.queries) && out.queries.length) return out.queries.slice(0, 3);
+  } catch {
+    /* fall through */
+  }
+  // Fallback query if the model misbehaves.
+  return [`${industry} ${node.role} ${context}`.slice(0, 180)];
+}
+
+/**
+ * Scores an agent's grounded output on a rubric. This replaces the hardcoded
+ * "Opportunity Assessment" table. Returns a 0-100 composite + label + dimensions,
+ * which is the "success rate" signal you wanted for the approval gate.
+ */
+async function scoreNode(node, apiKey, provider) {
+  const r = node.report;
+  const prompt = `
+Evaluate this research agent's output quality. Be a strict critic.
+
+Agent: ${node.name} (${node.role})
+Mandate: ${node.instructions}
+Findings: ${JSON.stringify(r.keyFindings)}
+Data points: ${JSON.stringify(r.dataPoints)}
+Sources used: ${JSON.stringify(r.sourceList)}
+Self-reported confidence: ${r.confidenceLevel}
+
+Score each dimension 0-100:
+- sourceQuality: are sources real, authoritative, and on-mandate?
+- coverage: did it actually address the mandate's questions?
+- specificity: concrete numbers/dates vs vague claims?
+- groundedness: are findings supported by the cited sources (no invented stats)?
+
+Respond with ONLY JSON:
+{ "sourceQuality": 0, "coverage": 0, "specificity": 0, "groundedness": 0, "rationale": "one line" }
+`;
+  try {
+    const s = await callAIProvider(prompt, apiKey, provider, true);
+    const dims = ['sourceQuality', 'coverage', 'specificity', 'groundedness'];
+    const composite = Math.round(dims.reduce((a, d) => a + (Number(s[d]) || 0), 0) / dims.length);
+    const label = composite >= 75 ? 'Strong' : composite >= 50 ? 'Moderate' : 'Weak';
+    return { composite, label, dimensions: s, rationale: s.rationale || '' };
+  } catch {
+    return { composite: 0, label: 'Weak', dimensions: {}, rationale: 'Scoring failed.' };
+  }
 }
 
 /**
@@ -451,7 +589,8 @@ export function flattenTreeReports(node) {
       name: node.name,
       role: node.role,
       level: node.level,
-      report: node.report
+      report: node.report,
+      score: node.score || null
     });
   }
   if (node.children) {
@@ -581,7 +720,7 @@ function getDynamicNodeMockReport(node, industry, context) {
 /**
  * Runs a real hierarchical query using selected API provider
  */
-async function executeTreeAPI(tree, industry, context, apiKey, provider, onProgress) {
+async function executeTreeAPI(tree, industry, context, apiKey, provider, onProgress, tavilyKey) {
   // 1. Analyze Master Objectives
   onProgress({ status: 'analyzing', message: 'Master Orchestrator analyzing brief and mapping hierarchical tree...' });
   await delay(1200);
@@ -593,8 +732,8 @@ async function executeTreeAPI(tree, industry, context, apiKey, provider, onProgr
   };
   collectNodes(tree);
 
-  onProgress({ 
-    status: 'objectives_created', 
+  onProgress({
+    status: 'objectives_created',
     objectives: [
       `Map strategic viability of ${industry} under context constraints.`,
       `Orchestrate deep-dive sub-agent queries across ${flatNodes.length} specialized levels.`
@@ -603,53 +742,81 @@ async function executeTreeAPI(tree, industry, context, apiKey, provider, onProgr
   });
   await delay(1000);
 
-  // Helper to execute single node via LLM
+  // Helper to execute single node: REAL research, grounded findings, then scoring.
   const executeNode = async (node, parentContext = "") => {
     onProgress({ status: 'agent_start', agentName: node.name, brief: node });
-    
-    onProgress({ status: 'agent_log', agentName: node.name, log: `Resolving mandates with API Provider: ${provider}...` });
-    await delay(600);
-    onProgress({ status: 'agent_log', agentName: node.name, log: `Analyzing instruction context for Level ${node.level}...` });
-    await delay(800);
+    const log = (msg) => onProgress({ status: 'agent_log', agentName: node.name, log: msg });
 
+    // 1. Turn the mandate into concrete search queries.
+    log(`Planning search queries for Level ${node.level} mandate...`);
+    const queries = await generateQueries(node, industry, context, apiKey, provider);
+
+    // 2. Retrieve REAL evidence, restricted to this agent's allowed domains.
+    let evidence = [];
+    if (tavilyKey) {
+      evidence = await gatherEvidence(queries, node.allowedDomains, tavilyKey, log);
+    } else {
+      log('No search key configured — running UNGROUNDED (findings will not be web-verified).');
+    }
+    const evidenceBlock = formatEvidenceForPrompt(evidence);
+
+    // 3. Synthesize findings that MUST be grounded in the retrieved sources.
     const nodePrompt = `
-You are the AI research agent "${node.name}" (Level ${node.level}) specializing in: "${node.role}".
-Your instructions: "${node.instructions}".
-Industry context: "${industry}" - "${context}".
-Parent agent findings context (if any): "${parentContext}".
+You are research agent "${node.name}" (Level ${node.level}), role: "${node.role}".
+Mandate: "${node.instructions}".
+Brief: "${industry}" - "${context}".
+Parent agent context: "${parentContext}".
 
-Perform virtual research and generate realistic, detailed, and data-rich findings matching your role.
-Provide findings, statistics/data points, realistic URLs, confidence, and gaps.
+You are given numbered SOURCES retrieved from the web. Base every finding and data
+point ONLY on these sources. Do NOT invent statistics. Every item in "sourceList"
+MUST be a URL that appears in the SOURCES below — never fabricate a URL. If the
+sources do not support a claim, omit it and record the missing information under "gaps".
 
-Response must be in JSON format matching this schema:
+SOURCES:
+${evidenceBlock}
+
+Respond with ONLY JSON:
 {
-  "keyFindings": ["string"],
-  "dataPoints": ["string"],
-  "sourceList": ["string"],
+  "keyFindings": ["string grounded in sources"],
+  "dataPoints": ["concrete stat/figure with the [n] source it came from"],
+  "sourceList": ["only URLs that appear above"],
   "confidenceLevel": "High" | "Medium" | "Low",
-  "gaps": ["string"]
+  "gaps": ["what the sources did not cover"]
 }
 `;
 
     const responseJson = await callAIProvider(nodePrompt, apiKey, provider, true);
-    
+
+    // Enforce that sourceList only contains URLs we actually retrieved.
+    const retrievedUrls = new Set(evidence.map((e) => e.url));
+    const verifiedSources = tavilyKey
+      ? (responseJson.sourceList || []).filter((u) => retrievedUrls.has(u))
+      : (responseJson.sourceList || []);
+
     node.status = "complete";
     node.report = {
       agentName: node.name,
       researchQuestion: node.instructions,
-      keyFindings: responseJson.keyFindings,
-      dataPoints: responseJson.dataPoints,
-      sourceList: responseJson.sourceList,
-      confidenceLevel: responseJson.confidenceLevel,
-      gaps: responseJson.gaps.join(", ")
+      keyFindings: responseJson.keyFindings || [],
+      dataPoints: responseJson.dataPoints || [],
+      sourceList: verifiedSources,
+      confidenceLevel: responseJson.confidenceLevel || 'Low',
+      gaps: Array.isArray(responseJson.gaps) ? responseJson.gaps.join(", ") : (responseJson.gaps || ''),
+      sourcesRetrieved: evidence.length,
+      grounded: Boolean(tavilyKey)
     };
 
-    onProgress({ status: 'agent_complete', agentName: node.name, report: node });
-    await delay(500);
+    // 4. Score the output (the "success rate" for your approval gate).
+    log('Scoring output quality...');
+    node.score = await scoreNode(node, apiKey, provider);
+    log(`Score: ${node.score.composite}/100 (${node.score.label}) — ${node.score.rationale}`);
 
-    // Run children in parallel
+    onProgress({ status: 'agent_complete', agentName: node.name, report: node, score: node.score });
+    await delay(300);
+
+    // Run children in parallel, passing this agent's findings down as context.
     if (node.children && node.children.length > 0) {
-      const childContext = `Findings from ${node.name}: ${responseJson.keyFindings.join('; ')}`;
+      const childContext = `Findings from ${node.name}: ${(responseJson.keyFindings || []).join('; ')}`;
       const promises = node.children.map(child => {
         child.status = "active";
         return executeNode(child, childContext);
@@ -672,10 +839,23 @@ Response must be in JSON format matching this schema:
   const flatReports = flattenTreeReports(tree);
   const reportsPayload = JSON.stringify(flatReports, null, 2);
 
+  const scored = flatReports.filter((r) => r.score);
+  const avgScore = scored.length
+    ? Math.round(scored.reduce((a, r) => a + r.score.composite, 0) / scored.length)
+    : null;
+  const scoreSummary = scored.length
+    ? scored.map((r) => `- ${r.name}: ${r.score.composite}/100 (${r.score.label})`).join('\n')
+    : 'No per-agent scores available.';
+
   const synthesisPrompt = `
 You are the Master Orchestrator (Level 0).
 Synthesize the following hierarchical research reports from your sub-agent network into a unified FINAL RESEARCH REPORT for "${industry}":
 ${reportsPayload}
+
+Per-agent quality scores (use these to weight confidence and to fill the Opportunity
+Assessment honestly — do not mark a dimension Strong if the agents that cover it scored low):
+Average research quality: ${avgScore === null ? 'N/A' : `${avgScore}/100`}
+${scoreSummary}
 
 Context Brief: "${context}"
 
@@ -740,8 +920,8 @@ async function executeTreeMock(tree, industry, context, onProgress) {
   };
   collectNodes(tree);
 
-  onProgress({ 
-    status: 'objectives_created', 
+  onProgress({
+    status: 'objectives_created',
     objectives: [
       `Map strategic viability of ${industry} under context constraints.`,
       `Orchestrate deep-dive sub-agent queries across ${flatNodes.length} specialized levels.`
@@ -803,7 +983,7 @@ async function executeTreeMock(tree, industry, context, onProgress) {
 
   const flatReports = flattenTreeReports(tree);
   const reportMarkdown = buildTreeMarkdownReport(industry, context, tree, flatReports);
-  
+
   onProgress({ status: 'complete', report: reportMarkdown });
   return { report: reportMarkdown, tree };
 }
@@ -812,55 +992,71 @@ async function executeTreeMock(tree, industry, context, onProgress) {
  * Main Run Orchestrator entry point (tree-compatible)
  */
 export async function runOrchestratorDetailed(industry, context, customAgents = [], options = {}) {
-  const { apiKey = null, provider = 'gemini', onProgress = () => {}, activeTree = null } = options;
-  
-  // Build a tree from inputs. Use activeTree if provided, otherwise select preset, or generate fallback tree.
+  const { apiKey = null, provider = 'gemini', onProgress = () => {}, activeTree = null, tavilyApiKey = null } = options;
+
+  // Build a tree from inputs. Priority: explicit activeTree (approved in UI) >
+  // LLM-designed tree (planner) > preset > hardcoded fallback.
   let treeToRun;
-  
+
   if (activeTree) {
-    // Clone tree
     treeToRun = JSON.parse(JSON.stringify(activeTree));
   } else {
-    // Determine preset matching
-    const matchKey = Object.keys(PRESETS).find(key => 
-      industry.toLowerCase().includes(PRESETS[key].industry.split(" ")[0].toLowerCase())
-    );
-    
-    if (matchKey) {
-      treeToRun = JSON.parse(JSON.stringify(PRESETS[matchKey].tree));
+    let planned = null;
+    if (apiKey) {
+      try {
+        onProgress({ status: 'analyzing', message: 'Master Orchestrator designing the sub-agent network from your brief...' });
+        planned = await planAgentTree(industry, context, apiKey, provider);
+      } catch (err) {
+        console.warn('Planner failed, falling back to preset/fallback tree:', err.message);
+      }
+    }
+
+    if (planned) {
+      treeToRun = planned;
     } else {
-      // Generate standard fallback tree
-      treeToRun = {
-        id: "agent-master",
-        name: "MASTER_ORCHESTRATOR",
-        role: "Master Orchestrator",
-        instructions: "Coordinates all research activities.",
-        level: 0,
-        status: "idle",
-        logs: [],
-        children: [
-          {
-            id: "agent-1",
-            name: "UNIT_ECONOMICS_AGENT",
-            role: "Unit Economics",
-            instructions: `Research margins and CAC for ${industry}.`,
-            level: 1,
-            status: "idle",
-            logs: [],
-            children: []
-          },
-          {
-            id: "agent-2",
-            name: "RISK_ANALYSIS_AGENT",
-            role: "Risk Management",
-            instructions: `Research regulatory threats and constraints for ${industry}.`,
-            level: 1,
-            status: "idle",
-            logs: [],
-            children: []
-          }
-        ]
-      };
+      // Determine preset matching
+      const matchKey = Object.keys(PRESETS).find(key =>
+        industry.toLowerCase().includes(PRESETS[key].industry.split(" ")[0].toLowerCase())
+      );
+
+      if (matchKey) {
+        treeToRun = JSON.parse(JSON.stringify(PRESETS[matchKey].tree));
+      } else {
+        // Generate standard fallback tree
+        treeToRun = {
+          id: "agent-master",
+          name: "MASTER_ORCHESTRATOR",
+          role: "Master Orchestrator",
+          instructions: "Coordinates all research activities.",
+          level: 0,
+          status: "idle",
+          logs: [],
+          children: [
+            {
+              id: "agent-1",
+              name: "UNIT_ECONOMICS_AGENT",
+              role: "Unit Economics",
+              instructions: `Research margins and CAC for ${industry}.`,
+              allowedDomains: [],
+              level: 1,
+              status: "idle",
+              logs: [],
+              children: []
+            },
+            {
+              id: "agent-2",
+              name: "RISK_ANALYSIS_AGENT",
+              role: "Risk Management",
+              instructions: `Research regulatory threats and constraints for ${industry}.`,
+              allowedDomains: [],
+              level: 1,
+              status: "idle",
+              logs: [],
+              children: []
+            }
+          ]
+        };
+      }
     }
   }
 
@@ -883,7 +1079,7 @@ export async function runOrchestratorDetailed(industry, context, customAgents = 
   // Run Tree API or Mock
   if (apiKey) {
     try {
-      return await executeTreeAPI(treeToRun, industry, context, apiKey, provider, onProgress);
+      return await executeTreeAPI(treeToRun, industry, context, apiKey, provider, onProgress, tavilyApiKey);
     } catch (err) {
       console.warn("Failed API run, falling back to mock:", err.message);
       // fallback
